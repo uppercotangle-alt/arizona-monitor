@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 import time
 from samp_client.client import SampClient
+import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -21,6 +22,8 @@ POLL_SECONDS = max(3, int(os.getenv("POLL_SECONDS", "5")))
 DB_PATH = os.getenv("DB_PATH", "monitor.db")
 TZ = ZoneInfo(os.getenv("TZ", os.getenv("TIMEZONE", "Europe/Kyiv")))
 QUERY_TIMEOUT = float(os.getenv("QUERY_TIMEOUT", "4"))
+API_URL = "https://online.g-rp.me/api/v1/projects/arizona-rp"
+MAX_API_AGE = int(os.getenv("MAX_API_AGE_SECONDS", "180"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("arizona-monitor")
@@ -30,7 +33,7 @@ dp = Dispatcher()
 monitor_task: asyncio.Task | None = None
 # Candidate state must be observed twice before confirmed transition.
 states = {name: {"online": None, "candidate": None, "candidate_count": 0,
-                 "players": None, "slots": None, "updated_at": None, "last_restart": None, "stale": True, "age": None}
+                 "players": None, "slots": None, "updated_at": None, "last_restart": None, "stale": True, "age": None, "source": "none", "display_online": None}
           for name in ("Yuma", "Show Low")}
 restart_pending = set()
 
@@ -69,41 +72,79 @@ async def query_server(name: str, host: str, port: int) -> dict:
             asyncio.to_thread(_sync_query, host, port), timeout=QUERY_TIMEOUT
         )
         return {"online": True, "players": players, "slots": slots,
-                "updated_at": now_text(), "stale": False, "age": 0}
+                "updated_at": now_text(), "stale": False, "age": 0, "source": "udp", "display_online": True}
     except Exception as exc:
-        log.warning("UDP query failed %s (%s:%s): %s", name, host, port, exc)
+        log.warning("UDP query failed %s (%s:%s): %s: %s", name, host, port, type(exc).__name__, exc)
         # A timeout can also mean UDP filtering, not necessarily a server restart.
         return {"online": False, "players": None, "slots": None,
-                "updated_at": None, "stale": False, "age": None}
+                "updated_at": None, "stale": True, "age": None, "source": "none", "display_online": None}
+
+async def api_fallback(failed_names):
+    """HTTP backup for display only; NEVER used to confirm UDP restarts."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(API_URL, params={"_ts": str(time.time_ns())},
+                                   headers={"Cache-Control": "no-cache"}) as response:
+                response.raise_for_status()
+                payload = await response.json(content_type=None)
+        by_name = {str(v.get("name", "")).casefold(): v for v in payload.get("servers", [])}
+        result = {}
+        for name in failed_names:
+            entry = by_name.get(name.casefold())
+            if not entry:
+                continue
+            raw_date = entry.get("updated_at")
+            age = None
+            try:
+                dt = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                age = max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+            except (TypeError, ValueError):
+                pass
+            result[name] = {"online": None,  # no transition evidence from HTTP
+                            "display_online": entry.get("responding"),
+                            "players": entry.get("online"),
+                            "slots": entry.get("max_slots"),
+                            "updated_at": raw_date,
+                            "stale": age is None or age > MAX_API_AGE,
+                            "age": age, "source": "api"}
+        return result
+    except Exception as exc:
+        log.warning("HTTP fallback failed: %s: %s", type(exc).__name__, exc)
+        return {}
 
 async def samp_snapshot():
     results = await asyncio.gather(*(
         query_server(name, host, port) for name, (host, port) in SERVERS.items()
     ))
-    return dict(zip(SERVERS, results))
+    data = dict(zip(SERVERS, results))
+    failed = [name for name, item in data.items() if item["source"] == "none"]
+    if failed:
+        data.update(await api_fallback(failed))
+    return data
 
 def render(snapshot=None):
     lines = ["🌵 <b>ARIZONA RP MONITOR</b>", "━━━━━━━━━━━━━━━━━━"]
-    for name in ("Yuma", "Show Low"):
+    for name in SERVERS:
         s = states[name]
-        if s["stale"]:
-            status = "⚠️ <b>ДАННЫЕ УСТАРЕЛИ</b>"
-        elif s["updated_at"] is None and s["players"] is None:
-            status = "🔴 <b>НЕТ ОТВЕТА UDP</b>"
-        elif s["online"] is True:
-            status = "🟢 <b>ONLINE</b>"
-        elif s["online"] is False:
-            status = "🔴 <b>НЕТ ОТВЕТА UDP</b>"
+        source = s.get("source", "none")
+        if source == "udp":
+            status = "🟢 <b>ONLINE (UDP)</b>"
+            source_line = "⚡ Прямой ответ сервера"
+        elif source == "api":
+            status = "🟡 <b>ПО ДАННЫМ API</b>" if not s["stale"] else "⚠️ <b>УСТАРЕВШИЕ ДАННЫЕ API</b>"
+            source_line = "📡 UDP недоступен, показан резервный API"
         else:
-            status = "🟡 <b>ОЖИДАНИЕ ДАННЫХ</b>"
+            status = "🔴 <b>НЕТ ДАННЫХ</b>"
+            source_line = "⚠️ UDP не ответил, резервный API тоже недоступен"
         players = f'{s["players"]}/{s["slots"]}' if s["players"] is not None and s["slots"] is not None else "—"
-        lines += [f"\n<b>{name}</b>", f"Статус: {status}", f"Игроки: <b>{players}</b>"]
-        if s["updated_at"]:
-            lines.append(f'<i>Ответ получен: {s["updated_at"]}</i>')
-        if s["stale"]:
-            age_text = f'{s["age"]} сек.' if s["age"] is not None else "неизвестно"
-            lines.append(f'⚠️ Нет свежего ответа от сервера ({age_text}).')
-    lines += ["", "━━━━━━━━━━━━━━━━━━", f"🕒 Проверено: {now_text()}", "<i>Нет ответа ≠ доказанный рестарт.</i>"]
+        lines += [f"\n<b>{name}</b>", f"Статус: {status}", f"Игроки: <b>{players}</b>", source_line]
+        if source == "api":
+            lines.append(f'🕒 Обновление источника: {s["updated_at"] or "неизвестно"}; возраст: {s["age"] if s["age"] is not None else "?"} сек.')
+    lines += ["", "━━━━━━━━━━━━━━━━━━", f"🕒 Проверено: {now_text()}",
+              "<i>UDP без ответа не означает, что сервер выключен.</i>"]
     return "\n".join(lines)
 
 async def notify(text):
@@ -122,9 +163,10 @@ async def process_snapshot(data, announce=True):
         st["updated_at"] = incoming["updated_at"]
         st["stale"] = incoming["stale"]
         st["age"] = incoming["age"]
-        if incoming["stale"]:
-            log.warning("Stale API result for %s: updated_at=%s age=%s", name, st["updated_at"], st["age"])
-            continue  # Never generate restart notifications from stale data.
+        st["source"] = incoming.get("source", "none")
+        st["display_online"] = incoming.get("display_online")
+        if incoming["stale"] or incoming.get("source") != "udp":
+            continue  # HTTP is display-only, UDP failures do NOT prove restart.
         if observed is None:
             continue
         # First observation initializes state silently.
@@ -179,7 +221,7 @@ async def monitor_loop():
 
 @dp.message(Command("start"))
 async def start(m: Message):
-    await m.answer("🌵 <b>Arizona RP Monitor</b>\n\nПрямой SA-MP Query для Yuma и Show Low.\nНажми «Проверить сейчас» или включи уведомления.", parse_mode="HTML", reply_markup=kb())
+    await m.answer("🌵 <b>Arizona RP Monitor</b>\n\nПрямой SA-MP Query для Yuma и Show Low с резервным API.\nНажми «Проверить сейчас» или включи уведомления.", parse_mode="HTML", reply_markup=kb())
 
 @dp.message(Command("check"))
 async def check_cmd(m: Message):
@@ -230,7 +272,7 @@ async def admin(m: Message):
     if m.from_user.id != ADMIN_ID:
         return
     count = len(await subscribers())
-    await m.answer(f"🛠 <b>Админ-панель</b>\nПодписчиков: {count}\nИнтервал: {POLL_SECONDS} сек.\nИсточник: SA-MP UDP Query", parse_mode="HTML")
+    await m.answer(f"🛠 <b>Админ-панель</b>\nПодписчиков: {count}\nИнтервал: {POLL_SECONDS} сек.\nИсточник: SA-MP UDP + резервный HTTP API", parse_mode="HTML")
 
 @dp.message(Command("ping"))
 async def ping(m: Message):
@@ -248,7 +290,9 @@ async def main():
             for name, item in data.items():
                 states[name].update(online=item["online"] if item["online"] else None, players=item["players"],
                                    slots=item["slots"], updated_at=item["updated_at"],
-                                   stale=item["stale"], age=item["age"])
+                                   stale=item["stale"], age=item["age"],
+                                   source=item.get("source", "none"),
+                                   display_online=item.get("display_online"))
         except Exception:
             log.exception("Initial SA-MP query failed; monitor will retry")
         monitor_task = asyncio.create_task(monitor_loop())
