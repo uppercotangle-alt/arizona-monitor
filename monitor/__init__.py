@@ -1,0 +1,1 @@
+"""Arizona RP API monitor."""
