@@ -26,17 +26,19 @@ class Preference:
     chat_id: int
     enabled: bool
     status_25: bool
-    status_52: bool
+    status_58: bool
     slots_25: bool
-    slots_52: bool
+    slots_58: bool
     payday: bool
     daily: bool
+    threshold_25: int
+    threshold_58: int
 
     def allow_status(self, sid: int) -> bool:
-        return self.enabled and (self.status_25 if sid == 25 else self.status_52)
+        return self.enabled and sid in SERVERS and (self.status_25 if sid == 25 else self.status_58)
 
     def allow_slots(self, sid: int) -> bool:
-        return self.enabled and (self.slots_25 if sid == 25 else self.slots_52)
+        return self.enabled and sid in SERVERS and (self.slots_25 if sid == 25 else self.slots_58)
 
 
 SCHEMA = """
@@ -74,7 +76,8 @@ CREATE TABLE IF NOT EXISTS sent_jobs (
   sent_at TEXT NOT NULL, PRIMARY KEY(chat_id, kind, bucket)
 );
 """
-ALLOWED_PREFS = {"status_25", "status_52", "slots_25", "slots_52", "payday", "daily"}
+ALLOWED_PREFS = {"status_25", "status_58", "slots_25", "slots_58", "payday", "daily"}
+ALLOWED_THRESHOLDS = {25: (950, 980, 990), 58: (700, 735, 740)}
 
 
 class DB:
@@ -84,14 +87,27 @@ class DB:
         self.conn = sqlite3.connect(path, timeout=5)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        # Safe in-place v3 -> v4 migration. Never overwrite old Show Low data.
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(prefs)")}
+        for column, kind, default in (
+            ("status_58", "INTEGER", 0),  # Explicit opt-in for existing subscribers.
+            ("slots_58", "INTEGER", 0),
+            ("threshold_25", "INTEGER", 980),
+            ("threshold_58", "INTEGER", 735),
+        ):
+            if column not in columns:
+                self.conn.execute(f"ALTER TABLE prefs ADD COLUMN {column} {kind} NOT NULL DEFAULT {default}")
         self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
 
     def _pref(self, row: sqlite3.Row) -> Preference:
-        return Preference(*(int(row[key]) if key == "chat_id" else bool(row[key]) for key in
-                            ("chat_id", "enabled", "status_25", "status_52", "slots_25", "slots_52", "payday", "daily")))
+        return Preference(int(row["chat_id"]), bool(row["enabled"]),
+                          bool(row["status_25"]), bool(row["status_58"]),
+                          bool(row["slots_25"]), bool(row["slots_58"]),
+                          bool(row["payday"]), bool(row["daily"]),
+                          int(row["threshold_25"]), int(row["threshold_58"]))
 
     def preference(self, chat: int) -> Preference:
         self.conn.execute("INSERT OR IGNORE INTO prefs(chat_id) VALUES (?)", (chat,))
@@ -117,6 +133,15 @@ class DB:
         self.conn.commit()
         return self.preference(chat)
 
+    def set_threshold(self, chat: int, sid: int, threshold: int) -> Preference:
+        if sid not in ALLOWED_THRESHOLDS or threshold not in ALLOWED_THRESHOLDS[sid]:
+            raise ValueError("Unknown threshold")
+        self.preference(chat)
+        with self.conn:
+            self.conn.execute(f"UPDATE prefs SET threshold_{sid}=? WHERE chat_id=?", (threshold, chat))
+            self.conn.execute("DELETE FROM slot_state WHERE chat_id=? AND server_id=?", (chat, sid))
+        return self.preference(chat)
+
     def subscribers(self) -> list[Preference]:
         rows = self.conn.execute("SELECT * FROM prefs WHERE enabled=1").fetchall()
         return [self._pref(row) for row in rows]
@@ -126,8 +151,13 @@ class DB:
         self.conn.commit()
 
     def last_10min_delta(self, sid: int, latest: Sample) -> tuple[int, int] | None:
-        # Require a reading 10–15 minutes before the latest sample.
-        target = latest.source_at - timedelta(minutes=10)
+        return self.delta(sid, latest, 10)
+
+    def delta(self, sid: int, latest: Sample, minutes: int) -> tuple[int, int] | None:
+        # Require a reading minutes to minutes+5 before the latest sample.
+        if not latest.responding:
+            return None
+        target = latest.source_at - timedelta(minutes=minutes)
         old = self.conn.execute(
             "SELECT online, source_at FROM samples WHERE server_id=? AND source_at<=? "
             "AND source_at>=? AND responding=1 ORDER BY source_at DESC LIMIT 1",
@@ -198,29 +228,37 @@ class DB:
                 events.append(event)
         return events, new_samples
 
-    def slot_alert_chats(self, sample: Sample, threshold: int = SLOT_LIMIT) -> list[int]:
+    def slot_alert_chats(self, sample: Sample, threshold: int | None = None) -> list[tuple[int, int]]:
         if not sample.responding:
             return []
-        result: list[int] = []
-        column = "slots_25" if sample.server_id == 25 else "slots_52"
+        if sample.server_id not in SERVERS:
+            return []
+        result: list[tuple[int, int]] = []
+        column = f"slots_{sample.server_id}"
+        limit_column = f"threshold_{sample.server_id}"
         with self.conn:
-            rows = self.conn.execute(f"SELECT chat_id FROM prefs WHERE enabled=1 AND {column}=1").fetchall()
+            rows = self.conn.execute(f"SELECT chat_id, {limit_column} AS threshold FROM prefs WHERE enabled=1 AND {column}=1").fetchall()
             for row in rows:
                 chat = int(row[0])
                 prev = self.conn.execute(
                     "SELECT below FROM slot_state WHERE chat_id=? AND server_id=?",
                     (chat, sample.server_id)).fetchone()
-                fire, below = slot_cross(None if prev is None else bool(prev[0]), sample.online, threshold)
+                chosen = int(row["threshold"]) if threshold is None else threshold
+                fire, below = slot_cross(None if prev is None else bool(prev[0]), sample.online, chosen)
                 self.conn.execute(
                     "INSERT INTO slot_state(chat_id,server_id,below) VALUES (?,?,?) "
                     "ON CONFLICT(chat_id,server_id) DO UPDATE SET below=excluded.below",
                     (chat, sample.server_id, int(below)))
                 if fire:
-                    result.append(chat)
+                    result.append((chat, chosen))
         return result
 
-    def recent_events(self, limit: int = 12) -> list[Event]:
-        rows = self.conn.execute("SELECT * FROM events ORDER BY happened_at DESC LIMIT ?", (limit,)).fetchall()
+    def recent_events(self, limit: int = 12, archive: bool = False) -> list[Event]:
+        # Show Low ID 52 is retained for read-only archive. Not monitored by v4.
+        if archive:
+            rows = self.conn.execute("SELECT * FROM events WHERE server_id=52 ORDER BY happened_at DESC LIMIT ?", (limit,)).fetchall()
+        else:
+            rows = self.conn.execute("SELECT * FROM events WHERE server_id IN (25,58) ORDER BY happened_at DESC LIMIT ?", (limit,)).fetchall()
         return [Event(int(row["server_id"]), row["kind"], dt_parse(row["happened_at"]),
                       dt_parse(row["since_at"]) if row["since_at"] else None,
                       row["duration_seconds"]) for row in rows]

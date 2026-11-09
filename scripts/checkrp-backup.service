@@ -1,0 +1,9 @@
+[Unit]
+Description=CheckRP SQLite backup
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/checkrp
+ExecStart=/home/ubuntu/checkrp/.venv/bin/python /home/ubuntu/checkrp/scripts/backup_db.py
+UMask=0077

@@ -7,7 +7,10 @@ from zoneinfo import ZoneInfo
 API_URL = "https://online.g-rp.me/api/v1/projects/arizona-rp"
 TZ = ZoneInfo("Europe/Moscow")
 UTC = timezone.utc
-SERVERS = {25: "Yuma", 52: "Show Low"}
+SERVERS = {25: "Yuma", 58: "Vice City"}
+SERVER_ICONS = {25: "🌵", 58: "🌴"}
+SERVER_LIMITS = {25: 980, 58: 735}
+ARCHIVED_SERVERS = {52: "Show Low"}
 MAX_DATA_AGE = 180
 SLOT_LIMIT = 980
 
@@ -83,7 +86,7 @@ def parse_api(data: object, now: datetime) -> Snapshot:
             peak_day=nonnegative_int(item.get("peak_day")),
         )
     if set(by_id) != set(SERVERS):
-        raise ValueError("API: Yuma or Show Low not found")
+        raise ValueError("API: Yuma or Vice City not found")
     # When roughly half of the *whole* project is down simultaneously, treat
     # the feed as suspicious rather than broadcasting false restart alerts.
     source_problem = len(raw) >= 10 and unavailable / len(raw) >= 0.45

@@ -10,7 +10,7 @@ from checkrp.db import DB
 
 
 def make(sid=25, at=None, responding=True, online=990):
-    return Sample(sid, "Yuma" if sid == 25 else "Show Low", online, 1000,
+    return Sample(sid, "Yuma" if sid == 25 else "Vice City", online, (1000 if sid == 25 else 750),
                   responding, at or datetime(2026, 11, 5, 12, 0, tzinfo=UTC))
 
 
@@ -25,13 +25,13 @@ class CoreTest(unittest.TestCase):
         data = {"servers": [{"id": 25, "name": "Yuma", "online": 747,
                              "max_slots": 1000, "responding": True,
                              "updated_at": "2026-11-05T10:12:01Z", "peak_hour": 754, "peak_day": 887},
-                            {"id": 52, "name": "Show Low", "online": 259,
-                             "max_slots": 1000, "responding": True,
+                            {"id": 58, "name": "Vice City", "online": 259,
+                             "max_slots": 750, "responding": True,
                              "updated_at": "2026-11-05T10:12:01Z"}]}
         data["servers"] += [{"id": i, "responding": True} for i in range(100, 110)]
         result = parse_api(data, now)
         self.assertEqual(result.servers[25].online, 747)
-        self.assertEqual(result.servers[52].name, "Show Low")
+        self.assertEqual(result.servers[58].name, "Vice City")
         self.assertTrue(result.servers[25].fresh(now))
         self.assertFalse(result.source_problem)
 
@@ -123,11 +123,11 @@ class StoreTest(unittest.TestCase):
     def test_preferences_and_slots_no_spam(self):
         self.db.set_enabled(345, True)
         self.db.toggle(345, "slots_25")
-        self.assertEqual(self.db.slot_alert_chats(make(25, self.base, True, 979)), [345])
+        self.assertEqual(self.db.slot_alert_chats(make(25, self.base, True, 979)), [(345, 980)])
         self.assertEqual(self.db.slot_alert_chats(make(25, self.base, True, 978)), [])
         self.assertEqual(self.db.slot_alert_chats(make(25, self.base, True, 980)), [])
-        self.assertEqual(self.db.slot_alert_chats(make(25, self.base, True, 979)), [345])
-        self.assertEqual(self.db.slot_alert_chats(make(52, self.base, True, 979)), [])
+        self.assertEqual(self.db.slot_alert_chats(make(25, self.base, True, 979)), [(345, 980)])
+        self.assertEqual(self.db.slot_alert_chats(make(58, self.base, True, 700)), [])
         self.db.set_enabled(345, False)
         self.assertEqual(self.db.subscribers(), [])
 
@@ -169,5 +169,60 @@ class ExtraOutageTests(unittest.TestCase):
                 self.assertEqual(data["downtime_seconds"], 3 * 60)
                 self.assertEqual(data["longest_downtime_seconds"], 3 * 60)
                 self.assertEqual(data["downs"], 1)
+            finally:
+                db.close()
+
+class MigrationTest(unittest.TestCase):
+    def test_preserves_archived_history_and_legacy_flags(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / 'legacy.sqlite3')
+            conn = sqlite3.connect(path)
+            conn.executescript('''
+                CREATE TABLE prefs(chat_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0,
+                    status_25 INTEGER NOT NULL DEFAULT 1, status_52 INTEGER NOT NULL DEFAULT 1,
+                    slots_25 INTEGER NOT NULL DEFAULT 0, slots_52 INTEGER NOT NULL DEFAULT 0,
+                    payday INTEGER NOT NULL DEFAULT 0, daily INTEGER NOT NULL DEFAULT 0);
+                INSERT INTO prefs VALUES(999,1,1,1,1,1,1,1);
+                CREATE TABLE events(id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER,
+                    kind TEXT, happened_at TEXT, since_at TEXT, duration_seconds INTEGER);
+                INSERT INTO events(server_id,kind,happened_at) VALUES (52,'down','2026-11-05T12:00:00+00:00');
+            ''')
+            conn.close()
+            db = DB(path)
+            try:
+                pref = db.preference(999)
+                self.assertTrue(pref.status_25)
+                self.assertFalse(pref.status_58)
+                self.assertFalse(pref.slots_58)
+                self.assertTrue(pref.payday)
+                self.assertTrue(pref.daily)
+                self.assertEqual(pref.threshold_58, 735)
+                self.assertEqual(len(db.recent_events(archive=True)), 1)
+                self.assertEqual(db.recent_events(), [])
+                # Migration is idempotent: the DB survives a restart intact.
+                db.close()
+                db = DB(path)
+                self.assertEqual(db.preference(999).threshold_25, 980)
+            finally:
+                db.close()
+
+    def test_vice_city_thresholds_independent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = DB(str(Path(folder) / 'db.sqlite3'))
+            try:
+                db.set_enabled(777, True)
+                db.toggle(777, 'slots_58')
+                sample = make(58, datetime(2026, 11, 9, 17, 0, tzinfo=UTC), True, 734)
+                self.assertEqual(db.slot_alert_chats(sample), [(777, 735)])
+                self.assertEqual(db.slot_alert_chats(sample), [])
+                db.set_threshold(777, 58, 740)
+                self.assertEqual(db.slot_alert_chats(sample), [(777, 740)])
+                self.assertEqual(db.slot_alert_chats(sample), [])
+                self.assertEqual(db.slot_alert_chats(make(25, sample.source_at, True, 979)), [])
+                with self.assertRaises(ValueError):
+                    db.set_threshold(777, 58, 1000)
+                with self.assertRaises(ValueError):
+                    db.toggle(777, 'slots_52')
             finally:
                 db.close()
