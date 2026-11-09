@@ -36,7 +36,7 @@ class UITest(unittest.TestCase):
         self.assertIn('Vice City', text)
         self.assertIn('735', text)
         rows = kb_settings(pref).inline_keyboard
-        self.assertTrue(any(b.callback_data == 'toggle:status_58' for row in rows for b in row))
+        self.assertTrue(any(b.callback_data == 'nt:58' for row in rows for b in row))
 
     def test_dashboard_uses_true_capacity(self):
         now = datetime.now(UTC)
@@ -45,6 +45,7 @@ class UITest(unittest.TestCase):
             58: Sample(58, 'Vice City', 540, 750, True, now),
         }, now, False, 37)
         text = dashboard(self.db, snapshot)
-        self.assertIn('540 / 750', text)
+        self.assertIn('540', text)
+        self.assertIn('/750', text)
         self.assertIn('72.0%', text)
         self.assertNotIn('Show Low', text)

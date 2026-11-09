@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CheckRP v4 — Yuma / Vice City Telegram native monitor, HTTP API only.
+"""CheckRP v4.5 — Yuma / Vice City Telegram native monitor, HTTP API only.
 
 Requires aiogram 3, aiohttp, matplotlib. For Python 3.11+.
 Keep BOT_TOKEN in the hosting environment, never in GitHub.
@@ -27,7 +27,10 @@ from checkrp.core import SERVER_LIMITS, TZ, UTC, SERVERS, Sample, Snapshot, payd
 from checkrp.db import DB, Event, Preference
 from checkrp.ui import (HELP, PLAYER_NOTICE, dashboard, event_text, events_text, kb_back,
                         kb_charts, kb_home, kb_settings, kb_compare, kb_events, kb_thresholds,
-                        comparison_text, server_details, settings_text, stats_text, when)
+                        kb_server_settings, kb_global_settings, kb_server_details, kb_analytics,
+                        kb_chart_photo, kb_report, analytics_text, server_settings_text,
+                        schedule_settings_text, thresholds_text, comparison_text,
+                        server_details, settings_text, stats_text, when, PERIOD_TIMES)
 
 log = logging.getLogger("checkrp")
 router = Router()
@@ -133,23 +136,27 @@ async def events(message: Message, app: App) -> None:
 
 
 @router.message(Command("stats"))
-async def stats(message: Message) -> None:
-    await message.answer("📈 <b>CHECKRP · ГРАФИКИ</b>\nВыбери сервер и период.\n\n"
-                         "История Vice City накапливается с обновления v4.",
-                         reply_markup=kb_charts())
+async def stats(message: Message, app: App) -> None:
+    await message.answer(analytics_text(app.db, app.api.latest, app.api.last_error),
+                         reply_markup=kb_analytics())
+
+
+def report_interval(period: str, now: datetime) -> tuple[datetime, datetime, str]:
+    if period == "today":
+        start = now.astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
+        return start, now, "СЕГОДНЯ · МСК"
+    if period == "24h":
+        return now - timedelta(hours=24), now, "24 ЧАСА · МСК"
+    if period == "7d":
+        return now - timedelta(days=7), now, "7 ДНЕЙ · МСК"
+    raise ValueError("unknown report period")
 
 
 @router.message(Command("report"))
 async def report(message: Message, app: App) -> None:
     now = datetime.now(UTC)
-    start = now.astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
-    await message.answer(stats_text(app.db, start, now, "СЕГОДНЯ"), reply_markup=kb_back("report"))
-    try:
-        figures = {sid: app.db.stats(sid, start, now) for sid in SERVERS}
-        png = await asyncio.to_thread(render_daily_report_png, figures, "СЕГОДНЯ · МСК")
-        await message.answer_photo(BufferedInputFile(png, filename="checkrp_daily.png"))
-    except Exception:
-        log.exception("Cannot render requested report image")
+    start, end, title = report_interval("today", now)
+    await message.answer(stats_text(app.db, start, end, title), reply_markup=kb_report("today"))
 
 
 @router.message(Command("compare"))
@@ -189,49 +196,90 @@ async def callback(call: CallbackQuery, app: App) -> None:
     message = call.message
     private = isinstance(message, Message) and message.chat.type == "private"
     chat_id = message.chat.id if isinstance(message, Message) else call.from_user.id
-    if data.startswith(("toggle:", "limit:")) or data in ("settings", "thresholds"):
+
+    # All subscriptions are private-chat preferences; never mutate in groups.
+    sensitive = (data == "settings" or data == "thresholds" or
+                 data.startswith(("toggle:", "limit:", "limits:", "nt:")))
+    if sensitive:
         if not private:
-            await call.answer("Настройки только в личном чате", show_alert=True)
+            await call.answer("Настройки доступны только в личном чате", show_alert=True)
             return
-        if data.startswith("limit:"):
-            try:
-                _, sid, chosen = data.split(":")
-                pref = app.db.set_threshold(chat_id, int(sid), int(chosen))
-            except (ValueError, TypeError):
-                await call.answer("Недопустимый порог", show_alert=True)
-                return
-        elif data.startswith("toggle:"):
-            name = data.split(":", 1)[1]
-            try:
+        try:
+            if data.startswith("toggle:"):
+                name = data.partition(":")[2]
                 if name == "enabled":
                     current = app.db.preference(chat_id)
                     pref = app.db.set_enabled(chat_id, not current.enabled)
                 else:
                     pref = app.db.toggle(chat_id, name)
-            except ValueError:
-                await call.answer("Неизвестная настройка")
-                return
-        else:
-            pref = app.db.preference(chat_id)
-        await call.answer("Сохранено" if data.startswith(("toggle:", "limit:")) else "")
-        if data == "thresholds" or data.startswith("limit:"):
-            await edit(call, "🎛 <b>ПОРОГИ ОНЛАЙНА</b>\nВыбери порог для каждого сервера.\nПосле изменения настройка применится при следующем обновлении.", kb_thresholds(pref))
-        else:
-            await edit(call, settings_text(pref), kb_settings(pref))
-        return
-    if data == "home" or data.startswith("g:"):
-        if not app.limiter.allow(call.from_user.id, 0.8):
-            await call.answer("⏳ Слишком быстро. Подожди секунду.")
+            elif data.startswith("limit:"):
+                _, sid_s, n_s = data.split(":")
+                pref = app.db.set_threshold(chat_id, int(sid_s), int(n_s))
+            else:
+                pref = app.db.preference(chat_id)
+        except (ValueError, TypeError):
+            await call.answer("Недопустимый параметр", show_alert=True)
             return
+
+        if data.startswith("limit:"):
+            sid = int(data.split(":")[1])
+            text, markup = thresholds_text(pref, sid), kb_thresholds(pref, sid)
+        elif data.startswith("limits:"):
+            sid = int(data.partition(":")[2]) if data.partition(":")[2] in ("25", "58") else -1
+            if sid not in SERVERS:
+                await call.answer("Сервер неизвестен")
+                return
+            text, markup = thresholds_text(pref, sid), kb_thresholds(pref, sid)
+        elif data == "thresholds":
+            text, markup = thresholds_text(pref), kb_thresholds(pref)
+        elif data.startswith("nt:"):
+            part = data.partition(":")[2]
+            if part == "global":
+                text, markup = schedule_settings_text(pref), kb_global_settings(pref)
+            elif part in ("25", "58"):
+                sid = int(part)
+                text, markup = server_settings_text(pref, sid), kb_server_settings(pref, sid)
+            else:
+                await call.answer("Неизвестная категория")
+                return
+        elif data.startswith("toggle:status_") or data.startswith("toggle:slots_"):
+            sid_s = data.rsplit("_", 1)[1]
+            sid = int(sid_s)
+            text, markup = server_settings_text(pref, sid), kb_server_settings(pref, sid)
+        elif data in ("toggle:payday", "toggle:daily"):
+            text, markup = schedule_settings_text(pref), kb_global_settings(pref)
+        else:
+            text, markup = settings_text(pref), kb_settings(pref)
+        await call.answer("✅ Сохранено" if data.startswith(("toggle:", "limit:")) else "")
+        await edit(call, text, markup)
+        return
+
+    if data in ("home", "charts") or data.startswith(("g:", "rp:")):
+        if not app.limiter.allow(call.from_user.id, 0.85):
+            await call.answer("⏳ Чуть медленнее")
+            return
+
     if data == "home":
-        await call.answer("🔄 Обновляю")
+        await call.answer("↻ Обновляю")
         snap, err = await latest(app)
         await edit(call, dashboard(app.db, snap, err), kb_home(user_pref(app, chat_id, private)))
     elif data.startswith("s:") and data[2:].isdigit() and int(data[2:]) in SERVERS:
+        sid = int(data[2:])
         await call.answer("🔎 Проверяю")
-        sid = int(data.split(":")[1])
         snap, err = await latest(app)
-        await edit(call, server_details(app.db, snap, sid, err), kb_back(data))
+        await edit(call, server_details(app.db, snap, sid, err), kb_server_details(sid))
+    elif data in ("charts",) or data.startswith("a:"):
+        if data == "charts":
+            selected, period = "both", "24h"
+        else:
+            parts = data.split(":")
+            if len(parts) != 3 or parts[1] not in ("25", "58", "both") or parts[2] not in PERIODS:
+                await call.answer("Неизвестный период", show_alert=True)
+                return
+            selected, period = parts[1], parts[2]
+        await call.answer()
+        snap, err = await latest(app)
+        await edit(call, analytics_text(app.db, snap, err, selected, period), kb_analytics(selected, period))
     elif data == "events":
         await call.answer()
         await edit(call, events_text(app.db.recent_events()), kb_events())
@@ -240,73 +288,80 @@ async def callback(call: CallbackQuery, app: App) -> None:
         await edit(call, events_text(app.db.recent_events(archive=True), archive=True), kb_events(archive=True))
     elif data.startswith("compare:"):
         try:
-            period = int(data.split(":", 1)[1])
+            minutes = int(data.partition(":")[2])
         except ValueError:
-            period = -1
-        if period not in (10, 30, 60):
+            minutes = -1
+        if minutes not in (10, 30, 60):
             await call.answer("Неизвестный период")
             return
-        await call.answer("⚖️ Сравниваю")
+        await call.answer()
         snap, err = await latest(app)
-        await edit(call, comparison_text(app.db, snap, err, period), kb_compare(period))
+        await edit(call, comparison_text(app.db, snap, err, minutes), kb_compare(minutes))
     elif data == "help":
         await call.answer()
         await edit(call, HELP, kb_back())
-    elif data == "report":
-        await call.answer()
-        now = datetime.now(UTC)
-        start = now.astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
-        await edit(call, stats_text(app.db, start, now, "СЕГОДНЯ"), kb_back("report"))
-    elif data == "charts":
-        await call.answer()
-        await edit(call, "📈 <b>CHECKRP · ГРАФИКИ</b>\nВыбери сервер и период.\nЕсть и сравнение по заполненности.", kb_charts())
-    elif data.startswith("g:"):
-        parts = data.split(":")
-        if len(parts) != 3 or parts[1] not in ({str(x) for x in SERVERS} | {"both"}) or parts[2] not in PERIODS:
+    elif data == "report" or data.startswith("r:"):
+        period = "today" if data == "report" else data.partition(":")[2]
+        try:
+            start, end, title = report_interval(period, datetime.now(UTC))
+        except ValueError:
             await call.answer("Неизвестный период")
             return
-        period = parts[2]
-        now = datetime.now(UTC)
-        since = now - PERIODS[period]
-        await call.answer("📊 Рисую график")
+        await call.answer()
+        await edit(call, stats_text(app.db, start, end, title), kb_report(period))
+    elif data.startswith("rp:"):
+        period = data.partition(":")[2]
+        try:
+            start, end, title = report_interval(period, datetime.now(UTC))
+        except ValueError:
+            await call.answer("Неизвестный отчёт")
+            return
+        await call.answer("🖼 Формирую отчёт")
         if not isinstance(message, Message):
             return
         try:
-            if parts[1] == "both":
+            figures = {sid: app.db.stats(sid, start, end) for sid in SERVERS}
+            png = await asyncio.to_thread(render_daily_report_png, figures, title)
+            await message.answer_photo(BufferedInputFile(png, filename=f"report_{period}.png"),
+                                       caption=f"📅 <b>CheckRP · {title}</b>\nПо истории HTTP API · МСК",
+                                       reply_markup=kb_report(period))
+        except Exception:
+            log.exception("Could not render report image")
+            await message.answer("⚠️ Не удалось сформировать PNG-отчёт.")
+    elif data.startswith("g:"):
+        parts = data.split(":")
+        if len(parts) != 3 or parts[1] not in ({str(x) for x in SERVERS} | {"both"}) or parts[2] not in PERIODS:
+            await call.answer("Неизвестный график")
+            return
+        selected, period = parts[1], parts[2]
+        await call.answer("📈 Строю график")
+        if not isinstance(message, Message):
+            return
+        since = datetime.now(UTC) - PERIODS[period]
+        try:
+            if selected == "both":
                 series = {sid: app.db.points(sid, since) for sid in SERVERS}
                 limits = {sid: (app.api.latest.servers[sid].max_slots if app.api.latest else (1000 if sid == 25 else 750))
                           for sid in SERVERS}
                 png = await asyncio.to_thread(render_comparison_png, series, period, limits)
-                if png is None:
-                    await message.answer("⌛ Ещё мало истории для сравнения.")
-                    return
-                caption = ("⚖️ <b>Yuma × Vice City</b>\n"
-                           "Заполненность в % от вместимости каждого сервера.\n"
-                           "<i>Данные g-rp.me · МСК</i>")
-                filename = f"comparison_{period}.png"
+                caption = f"⚖️ <b>Yuma × Vice City</b> · {period}\nЗаполненность в % от вместимости каждого сервера."
             else:
-                sid = int(parts[1])
+                sid = int(selected)
                 points = app.db.points(sid, since)
-                if len(points) < 2:
-                    await message.answer("⌛ Ещё мало истории для графика. Дай боту накопить данные.")
-                    return
                 capacity = app.api.latest.servers[sid].max_slots if app.api.latest else (1000 if sid == 25 else 750)
                 png = await asyncio.to_thread(render_png, points, SERVERS[sid], period, capacity)
-                if png is None:
-                    return
-                stat = app.db.stats(sid, since, now)
-                avg = f"{float(stat['avg_online']):.0f}" if stat["avg_online"] is not None else "—"
-                caption = (f"📈 <b>{SERVERS[sid]} · {period}</b>\n"
-                           f"Средний онлайн: {avg} · Пик: {stat['peak'] if stat['peak'] is not None else '—'}\n"
-                           f"Измерений: {stat['n']}\n<i>HTTP API · МСК</i>")
-                filename = f"{sid}_{period}.png"
-            await message.answer_photo(BufferedInputFile(png, filename=filename), caption=caption,
-                                       reply_markup=kb_charts())
+                caption = f"📈 <b>{SERVERS[sid]}</b> · {period}\nИстория онлайна · МСК · HTTP API"
+            if png is None:
+                await message.answer("⌛ Пока недостаточно истории для выбранного графика.",
+                                     reply_markup=kb_analytics(selected, period))
+                return
+            await message.answer_photo(BufferedInputFile(png, filename=f"checkrp_{selected}_{period}.png"),
+                                       caption=caption, reply_markup=kb_chart_photo(selected, period))
         except Exception:
             log.exception("Unable to render graph")
             await message.answer("⚠️ Не удалось построить график. Попробуй позже.")
     else:
-        await call.answer("Кнопка устарела. Нажми /check.")
+        await call.answer("Эта кнопка устарела. Открой /check.")
 
 
 async def send(bot: Bot, app: App, chat_id: int, text: str) -> bool:
@@ -439,7 +494,7 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
     timeout = aiohttp.ClientTimeout(total=12, connect=5)
-    async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "CheckRP/4.0"}) as session:
+    async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "CheckRP/4.5"}) as session:
         db = DB(db_file)
         api = APIClient(session)
         app = App(db=db, api=api, poll_seconds=poll, admin_id=admin_id)
@@ -453,10 +508,10 @@ async def main() -> None:
             await bot.set_my_commands([
                 BotCommand(command="check", description="🌵 Yuma и Vice City"),
                 BotCommand(command="notify", description="🔔 Настройки уведомлений"),
-                BotCommand(command="stats", description="📈 Графики онлайна"),
+                BotCommand(command="stats", description="📊 Аналитика и графики"),
                 BotCommand(command="events", description="📋 История отключений"),
                 BotCommand(command="compare", description="⚖️ Сравнение серверов"),
-                BotCommand(command="report", description="📅 Сегодняшняя статистика"),
+                BotCommand(command="report", description="📅 Отчёты и PNG"),
                 BotCommand(command="player", description="🔎 О поиске игрока"),
                 BotCommand(command="help", description="ℹ️ О боте"),
             ])

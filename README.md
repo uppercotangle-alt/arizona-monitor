@@ -1,137 +1,96 @@
-# 🌵 CheckRP v4.0 — Yuma / Vice City · Telegram + Oracle
+# 🌵 CheckRP 4.5 — Telegram-native redesign
 
-Телеграм-бот на Python 3.11+ / aiogram 3, без Web App и без UDP. Данные только из HTTP API:
-https://online.g-rp.me/api/v1/projects/arizona-rp
+**Yuma (25) × Vice City (58)** on Oracle Cloud / Ubuntu 24.04. Uses **only** the
+[g-rp.me HTTP API](https://online.g-rp.me/api/v1/projects/arizona-rp),
+Python 3.11+, aiogram 3, SQLite, Matplotlib. **No Web App, no UDP.**
 
-## Что изменилось
+## What's new in 4.5
 
-- Yuma (ID `25`, обычно 1000 слотов) и **Vice City (ID `58`, 750 слотов)** вместо Show Low.
-- Telegram-native сообщения, компактные полоски заполненности, правильные проценты и свободные слоты, обновление сообщения по кнопке.
-- Кнопка **⚖️ Сравнение** и команда `/compare`: заполненность и изменения за 10/30/60 минут.
-- Тёмные PNG-графики 1 ч / 24 ч / 7 дней. Новый график-сравнение нормирует онлайн к проценту вместимости.
-- Подписка: изменения `responding`, низкий онлайн (Yuma порог 980, Vice City 735; выбор из пресетов), пейдей за 10 минут до :00/:30, отчёт в ~21:00 МСК. Нет бесконечных повторов при неизменном API.
-- Ежедневный отчёт также отправляется PNG-карточкой с данными; `/report` выводит текст + картинку.
-- Миграция существующей SQLite: старые записи Show Low **не переписываются** под Vice City. `/events` → «Архив Show Low». Старые v3 подписки 52 остаются в базе, но больше не отправляются. Подписки на статус Vice City требуют отдельного включения.
-- Опциональный ежедневный SQLite backup + systemd timer в `scripts/`.
-- `systemd` для круглосуточной работы на Oracle, без открытых публичных HTTP-портов.
+- **New monitor message:** separate server cards with online, occupancy, free slots, delta, freshness, time to payday; existing message edited on refresh.
+- **Analytics:** a *single message* with selectable **Yuma / Vice City / both** and **1h / 6h / 24h / 7d** periods. The `🖼 Построить PNG-график` button sends a proper image (no dummy data).
+- **Server details:** 24h stats and peaks, with direct links to graphs and notifications.
+- **Notification center:** global enable/disable, separate pages for each server, separate schedule page, individual threshold page. User subscriptions, thresholds and SQLite history retained.
+- **Reports:** today, last 24h or last 7d; an optional PNG button.
+- **Charts:** redesigned dark 16:9 visual cards, new metric headers, Moscow-time labels, separate Yuma / Vice City accent colors, no zeros manufactured from missing API data.
+- **Compatibility:** old `charts` and `report` callback actions still route to new pages. `Show Low` remains an events archive, never incorrectly converted to Vice City history.
+- **Testing:** core, API sample processing, SQLite migration, Telegram callback contracts, PNG generation.
 
-### Принципиальные ограничения
+## Notes and limitations
 
-- `responding=false` не доказывает рестарт. Источник может запаздывать и может ошибаться.
-- API не предоставляет список игроков, их ID и никнеймы; `/player` честно сообщает об ограничении.
-- Старые данные Show Low доступны как архив событий, но графики строятся только для текущих двух серверов.
-- Пороги выбираются из кнопочных значений: Yuma `950/980/990`, Vice City `700/735/740`.
-- История Vice City накопится **после** запуска v4; исторические точки никогда не подделываются.
-- Нет гарантий 100% доступности стороннего API или самого Oracle Free Tier.
+- `/check`, `/stats`, `/compare`, `/notify`, `/events`, `/report`, `/health` supported. `/player` is informational: the public API provides no player nicknames/IDs.
+- A disappearance of HTTP `responding` **is not proof** of a game restart.
+- No public API is guaranteed to update every 20 seconds; sampling/alerts handle stale timestamps.
+- A report reflects the data *accumulated by your own bot*; it is not a complete external historical feed.
+- All schedules use **Moscow time (Europe/Moscow)**, including 21:00 daily reports and payday at `:00` / `:30`.
+- `active (running)` is not enough to prove a successful deployment. Check the logs and interact with Telegram.
 
-## Развёртывание обновления на существующей Oracle VPS
+## Update your existing Oracle VPS — after uploading the ZIP to GitHub
 
-> Важно: **у тебя есть рабочая версия v3!** Сначала сделай резервную копию и не запускай две копии с одним Telegram-токеном.
+Do **not** upload `.env`, `data/`, SQLite databases, or SSH private keys to GitHub.
+Upload all files **at the root of** `uppercotangle-alt/arizona-monitor` (no nested ZIP directory).
 
-### Вариант А: сначала обновить GitHub
+On Windows PowerShell, connect using your existing key:
 
-Загрузи содержимое этого ZIP в корень репозитория `uppercotangle-alt/arizona-monitor` (через GitHub Desktop или локальный `git`). Не загружай `.env`, `.sqlite3`, приватные SSH-ключи и папку `data/`.
+```powershell
+& "$env:WINDIR\System32\OpenSSH\ssh.exe" -i "$env:USERPROFILE\.ssh\checkrp_oracle" ubuntu@152.70.183.27
+```
 
-На сервере (в PowerShell уже после SSH-подключения):
+Inside **Ubuntu**:
 
 ```bash
-cd /home/ubuntu/checkrp
+cd ~/checkrp
+# First review what GitHub will change:
+git fetch origin main
+git diff --stat HEAD origin/main
+
+# Then run the controlled update with a database backup and code rollback:
+bash scripts/deploy_v45.sh
+```
+
+If `scripts/deploy_v45.sh` isn't on the *old* deployed branch yet, run:
+
+```bash
+cd ~/checkrp
+curl -fsSL https://raw.githubusercontent.com/uppercotangle-alt/arizona-monitor/main/scripts/deploy_v45.sh -o /tmp/checkrp-deploy-v45.sh
+bash /tmp/checkrp-deploy-v45.sh
+```
+
+Only run that second option **after** inspecting the script in your own GitHub repo; remote content may change. You may instead copy the script from this ZIP to the VPS with `scp` for maximum control.
+
+When successful:
+
+```bash
+sudo systemctl status checkrp --no-pager -l
+sudo journalctl -u checkrp -n 60 --no-pager -l
+systemctl is-enabled checkrp
+```
+
+Then in Telegram: `/check` → `📊 Аналитика` → change tabs and period → `🖼 Построить PNG-график`. `/notify` → configure Yuma/Vice City independently. `/report` → choose time range → generate PNG. Old v4 messages still have working `charts` / `report` buttons where possible.
+
+### Manual rollback
+
+The updater automatically restores old tracked code if installation/tests fail; the SQLite backup is under `~/checkrp/backups/pre-v45-<timestamp>.sqlite3`.
+To revert later, after recording the SHA of v4 before upgrading:
+
+```bash
+cd ~/checkrp
 sudo systemctl stop checkrp
-# Горячая SQLite-копия, безопасная при WAL; бот уже остановлен.
-mkdir -p backups
-python3 - <<'PY'
-from pathlib import Path
-import sqlite3, shutil
-src=Path('data/checkrp.sqlite3')
-if src.exists():
-    dst=Path('backups/pre-v4.sqlite3')
-    with sqlite3.connect(src) as s, sqlite3.connect(dst) as t:
-        s.backup(t)
-    print('Backup:',dst)
-PY
-# Сохраним старый код для отката
-umask 077 && tar -czf ~/checkrp-pre-v4.tgz --exclude=.venv -C ~ checkrp
-git pull --ff-only
+git reset --hard OLD_V4_SHA  # do NOT paste literally; substitute the actual saved SHA
+sudo systemctl start checkrp
+```
+
+Because v4.5 does not change DB schema, data needn't be rolled back for ordinary code rollback. Never replace current SQLite with an old backup unless deliberately discarding newer data.
+
+### Local tests
+
+```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m unittest discover -s tests -v
-sudo systemctl start checkrp
-sudo systemctl status checkrp --no-pager -l
-sudo journalctl -u checkrp -n 40 --no-pager -l
 ```
 
-Для безопасного отката лучше сохранить git commit SHA (`git rev-parse HEAD`) до обновления. Архив `~/checkrp-pre-v4.tgz` содержит старый код и базу, но не виртуальное окружение.
+The current repository was tested with synthetic data locally. Production verification requires an installed aiogram and a live Telegram bot on your Oracle VPS.
 
-### Вариант Б: загрузить ZIP напрямую (без GitHub)
+## Security
 
-На **Windows PowerShell** (не в Ubuntu), если ZIP сохранён в Downloads:
-
-```powershell
-& "$env:WINDIR\System32\OpenSSH\scp.exe" -i "$env:USERPROFILE\.ssh\checkrp_oracle" "$env:USERPROFILE\Downloads\CheckRP-v4-Yuma-ViceCity.zip" ubuntu@152.70.183.27:~/checkrp-v4.zip
-```
-
-На сервере:
-
-```bash
-sudo systemctl stop checkrp
-cd ~/checkrp
-mkdir -p backups
-python3 - <<'PY'
-from pathlib import Path
-import sqlite3
-src=Path('data/checkrp.sqlite3')
-if src.exists():
-    with sqlite3.connect(src) as s, sqlite3.connect('backups/pre-v4.sqlite3') as t:
-        s.backup(t)
-PY
-sudo apt-get install -y unzip
-unzip -o ~/checkrp-v4.zip -d ~/checkrp
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m unittest discover -s tests -v
-sudo systemctl start checkrp
-sudo journalctl -u checkrp -n 40 --no-pager -l
-```
-
-Zip не содержит `.env` и не трогает `data/checkrp.sqlite3`.
-
-**Если ошибка при обновлении:** не оставляй старую службу запущенной на несовместимом коде. Сохрани вывод `journalctl`, останови её и верни код из резервной копии или прежнего коммита. База обратно совместима с v3 по сохранённым колонкам `status_52`/`slots_52`, но резервная копия всё равно необходима.
-
-### Проверка после запуска
-
-1. `systemctl is-enabled checkrp` и `systemctl is-active checkrp` → `enabled`, `active`.
-2. Telegram: `/check`, Vice City, `/compare`, `/stats` → Yuma/Vice City, `/events` → Архив Show Low, `/report`.
-3. `/notify`: новые настройки Vice City **отдельно включи**. Порог Vice City выбирается в кнопке «Настроить пороги».
-4. `/health` от администратора; затем `sudo journalctl -u checkrp -n 60 --no-pager -l`.
-5. Секреты в `.env` не показывай и не отправляй скриншотами; ранее раскрытый токен перевыпусти через BotFather.
-
-### Автоматические SQLite-бэкапы (необязательно)
-
-```bash
-sudo cp scripts/checkrp-backup.service scripts/checkrp-backup.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now checkrp-backup.timer
-systemctl list-timers | grep checkrp
-```
-
-По умолчанию сохраняет семь последних файлов в `~/checkrp/backups`. Эти бэкапы в той же VPS — для серьёзной защиты от потери машины делай периодически *внешнюю* резервную копию.
-
-## Конфигурация
-
-В `.env` на VPS (не включён в ZIP):
-
-```env
-BOT_TOKEN=PASTE_NEW_TOKEN_FROM_BOTFATHER
-ADMIN_ID=YOUR_TELEGRAM_NUMERIC_ID
-POLL_SECONDS=20
-DB_PATH=/home/ubuntu/checkrp/data/checkrp.sqlite3
-```
-
-`systemd` service файл сохраняется существующий `/etc/systemd/system/checkrp.service`; в этом обновлении его не нужно пересоздавать.
-
-## Тесты
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-Юнит-тесты не требуют токен. Они проверяют парсинг, API timestamps, дедуп, подтверждение недоступности, миграцию v3, пороги и архив. Для теста Telegram handlers требуется реальный aiogram в среде VPS; live Telegram/API интеграция проверяется отдельно после деплоя.
+Keep `BOT_TOKEN` exclusively in `.env` or a secret store, not in GitHub. Rotate any token previously leaked in chats or screenshots. `.env`, `data`, SQLite, `.venv`, backups are gitignored.
